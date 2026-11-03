@@ -34,8 +34,9 @@ if TYPE_CHECKING:
 class TaskWorkQueueMiddleware(QueueMiddleware):
     """Map tracked queue deliveries to semantic TaskTracker operations."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_requeues: int = -1) -> None:
         self._enqueue_locks = KeyedAsyncLockPool()
+        self._max_requeues = max_requeues
 
     @property
     def _tracker(self) -> "TaskTracker":
@@ -135,7 +136,17 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
         if not metadata.account_id or not metadata.user_id:
             raise TaskWorkRejected(f"Task {metadata.task_id} work is missing owner metadata")
 
-        duplicate = await self._reconcile_delivery(metadata, ctx.queue)
+        work = (
+            await self._tracker.get_work(
+                metadata.task_id,
+                metadata.work_id,
+                account_id=metadata.account_id,
+                user_id=metadata.user_id,
+            )
+            if self._max_requeues >= 0
+            else None
+        )
+        duplicate = await self._reconcile_delivery(metadata, ctx.queue, work=work)
         if duplicate is not None:
             return duplicate
 
@@ -145,6 +156,21 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
             user_id=metadata.user_id,
         ):
             result = await ctx.cancel()
+            await self._persist_result(metadata, result)
+            return result
+
+        if (
+            self._max_requeues >= 0
+            and work is not None
+            and work.requeue_count > self._max_requeues
+        ):
+            cleanup_result = await ctx.cancel()
+            if cleanup_result.outcome is ProcessOutcome.FAILED:
+                await self._persist_result(metadata, cleanup_result)
+                return cleanup_result
+            result = ProcessResult.failed(
+                f"Queue requeue limit reached: {self._max_requeues}"
+            )
             await self._persist_result(metadata, result)
             return result
 
@@ -197,6 +223,8 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
         self,
         metadata: "QueueTaskMetadata",
         queue_name: str,
+        *,
+        work=None,
     ) -> ProcessResult | None:
         from openviking.service.task_domain import WorkState
 
@@ -205,11 +233,15 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
             account_id=metadata.account_id,
             user_id=metadata.user_id,
         )
-        state = await self._tracker.get_work_state(
-            metadata.task_id,
-            metadata.work_id,
-            account_id=metadata.account_id,
-            user_id=metadata.user_id,
+        state = (
+            work.state
+            if work is not None
+            else await self._tracker.get_work_state(
+                metadata.task_id,
+                metadata.work_id,
+                account_id=metadata.account_id,
+                user_id=metadata.user_id,
+            )
         )
         if status is None or status in TERMINAL_TASK_STATUSES:
             if state is not None:
